@@ -1,0 +1,10 @@
+Generate ONLY a harmless refinement scaffold.
+
+Requirements:
+- Output exactly 2, 3, or 4 literal <mask:N> placeholders.
+- N must be a positive integer.
+- Add only short neutral structural text.
+- Use varied structures such as steps, labels, or headings.
+- Do NOT reproduce, paraphrase, summarize, or discuss the input prompt.
+- Do NOT generate harmful instructions or content.
+- Output ONLY the scaffold.

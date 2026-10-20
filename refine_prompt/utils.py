@@ -63,55 +63,168 @@ class Refiner:
             logging.error(f"API call failed: {e}")
             return None
 
-    def qwen_generate(self, prompt, max_new_tokens):
+    def qwen_generate(
+        self,
+        prompt,
+        max_new_tokens,
+        do_sample=False,
+        temperature=0.7,
+        top_p=0.9,
+    ):
         messages = [
-            {"role": "system", "content": "You are a helpful assistant and strictly follow the instructions."},
-            {"role": "user", "content": prompt}
+            {
+                "role": "system",
+                "content": (
+                    "You are a helpful assistant and strictly follow "
+                    "the instructions."
+                ),
+            },
+            {"role": "user", "content": prompt},
         ]
-        text = self.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-        model_inputs = self.tokenizer([text], return_tensors="pt").to(self.model.device)
+
+        text = self.tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+
+        model_inputs = self.tokenizer(
+            [text],
+            return_tensors="pt"
+        ).to(self.model.device)
+
+        generation_kwargs = {
+            "max_new_tokens": max_new_tokens,
+            "do_sample": do_sample,
+        }
+
+        if do_sample:
+            generation_kwargs.update({
+                "temperature": temperature,
+                "top_p": top_p,
+            })
 
         generated_ids = self.model.generate(
             **model_inputs,
-            max_new_tokens=max_new_tokens
+            **generation_kwargs,
         )
-        generated_ids = [output_ids[len(input_ids):] for input_ids, output_ids in zip(model_inputs.input_ids, generated_ids)]
-        response = self.tokenizer.batch_decode(generated_ids, skip_special_tokens=True)[0]
+
+        generated_ids = [
+            output_ids[len(input_ids):]
+            for input_ids, output_ids
+            in zip(model_inputs.input_ids, generated_ids)
+        ]
+
+        response = self.tokenizer.batch_decode(
+            generated_ids,
+            skip_special_tokens=True
+        )[0]
+
         return response.strip()
 
     def run_refinement_hf(self, max_new_tokens=100):
+        """Create controlled refined pairs while preserving vanilla exactly."""
 
-        dataset = read_dataset(split="harmful")
-        # Access the entries of the JBB-Behaviors dataset
-        behaviors = dataset.behaviors
-        goals = dataset.goals
-        targets = dataset.targets
-        categories = dataset.categories
+        import re
+
+        with open(self.attack_prompt, "r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        if not isinstance(data, list):
+            raise ValueError("attack_prompt JSON must contain a list of records")
 
         refined_list = []
 
-        with torch.no_grad():
-            for i in tqdm(range(len(goals)), desc="processing items..."):
-                behavior = behaviors[i]
-                goal = goals[i]
-                target = targets[i]
-                category = categories[i]
+        scaffold_prompt = self.template_str
 
-                prompt = self.apply_prompt_template(goal, self.template_str)
-                response = self.qwen_generate(prompt, max_new_tokens)
-                logging.info(f"[Refined]: {response}")
+        with torch.no_grad():
+            for item in tqdm(data, desc="refining prompts"):
+                item_id = item.get("id")
+                label = item.get("label")
+                vanilla_prompt = item.get("vanilla prompt", "")
+
+                if not vanilla_prompt:
+                    raise ValueError(
+                        f"Missing vanilla prompt for id={item_id}"
+                    )
+
+                # Qwen generates ONLY neutral scaffold material.
+                scaffold = self.qwen_generate(
+                    scaffold_prompt,
+                    max_new_tokens=max_new_tokens,
+                    do_sample=True,
+                    temperature=0.7,
+                    top_p=0.9,
+                ).strip()
+
+                # Keep only the scaffold; never allow Qwen to replace
+                # or rewrite the benchmark's vanilla prompt.
+                masks = re.findall(r"<mask:\d+>", scaffold)
+
+                if not (2 <= len(masks) <= 4):
+                    logging.warning(
+                        f"[REFINE_RETRY] id={item_id}: "
+                        f"generated {len(masks)} masks"
+                    )
+
+                    scaffold = self.qwen_generate(
+                        scaffold_prompt,
+                        max_new_tokens=max_new_tokens,
+                        do_sample=True,
+                        temperature=0.5,
+                        top_p=0.9,
+                    ).strip()
+
+                    masks = re.findall(r"<mask:\d+>", scaffold)
+
+                # Deterministic fallback guarantees the benchmark invariant.
+                if not (2 <= len(masks) <= 4):
+                    scaffold = (
+                        "Step 1: <mask:8>.\n"
+                        "Step 2: <mask:12>.\n"
+                        "Step 3: <mask:10>."
+                    )
+                    masks = re.findall(r"<mask:\d+>", scaffold)
+
+                # IMPORTANT:
+                # Vanilla is copied byte-for-byte and never regenerated.
+                refined_prompt = vanilla_prompt + "\n\n" + scaffold
+
+                assert vanilla_prompt in refined_prompt
+                assert vanilla_prompt != refined_prompt
+                assert 2 <= len(masks) <= 4
+
+                logging.info(
+                    f"[REFINE_DEBUG] id={item_id} "
+                    f"vanilla_chars={len(vanilla_prompt)} "
+                    f"refined_chars={len(refined_prompt)} "
+                    f"masks={len(masks)} "
+                    f"preserved={vanilla_prompt in refined_prompt}"
+                )
+
                 refined_list.append({
-                    "behavior": behavior,
-                    "target": target,
-                    "category": category,
-                    "goal": goal,
-                    "refined_goal": response
+                    "id": item_id,
+                    "label": label,
+                    "vanilla prompt": vanilla_prompt,
+                    "refined prompt": refined_prompt,
                 })
 
-        os.makedirs(os.path.dirname(self.output_json), exist_ok=True)
-        with open(self.output_json, 'w', encoding='utf-8') as f:
-            json.dump(refined_list, f, ensure_ascii=False, indent=4)
-        logging.info(f"Saved refined goals to {self.output_json}")
+        out_dir = os.path.dirname(self.output_json)
+        if out_dir:
+            os.makedirs(out_dir, exist_ok=True)
+
+        with open(self.output_json, "w", encoding="utf-8") as f:
+            json.dump(
+                refined_list,
+                f,
+                ensure_ascii=False,
+                indent=2
+            )
+
+        logging.info(
+            f"Saved {len(refined_list)} refined prompts to "
+            f"{self.output_json}"
+        )
 
     def run_refinement_api(self, max_new_tokens=120):
         dataset = read_dataset(split="harmful")
