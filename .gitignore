@@ -1,22 +1,36 @@
-/DLLM_safety/
-.vscode-server/
-.cache/
-*.json
-.vscode-server/
-.cache/
+# Python
 __pycache__/
-*.log
-.vscode-server/
-.cache/
-__pycache__/
-*.log
+*.py[cod]
+*.so
 
-# Local virtual environment
+# Virtual environments
 .venv/
+venv/
 
-# Local backup copies
+# Logs
+*.log
+
+# Backup/checkpoint files
 *.bak
 *.before_*
 
-# Local experiment artifacts
+# IDE/cache
+.vscode/
+.vscode-server/
+.cache/
+
+# Local datasets / intermediate experiments
+analysis/datasets/*.json
+analysis/results/
+
+# Keep selected reproducible dataset
+!analysis/datasets/wildjailbreak_20_refined_v3.json
+
+# Local model files
+*.safetensors
+*.bin
+*.pt
+*.pth
+
+# Large research directories
 analysis/GSAI-ML/
